@@ -2,6 +2,8 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <notify.h>
+#import <fcntl.h>
+#import <unistd.h>
 
 @interface BBBulletin : NSObject
 @property (nonatomic, copy) NSString *title;
@@ -39,13 +41,36 @@
 
 static __weak BBServer *gBBServer = nil;
 static dispatch_queue_t gMonitorQueue;
-static dispatch_source_t gMonitorTimer;
+static dispatch_source_t gFallbackTimer;
+static dispatch_source_t gDirectorySource;
 static NSMutableOrderedSet<NSString *> *gRecentReports;
 static NSTimeInterval gLastCheck = 0;
+static int gCrashDirectoryFD = -1;
 
-static NSString *const kCNSectionID = @"jp.dcsyhi.culprit";
+static NSString *const kCNFallbackBundleID = @"jp.dcsyhi.culprit";
 static NSString *const kCNStatePath = @"/var/mobile/Library/Preferences/com.551.culpritnotify.state.plist";
 static NSString *const kCNCrashDirectory = @"/var/mobile/Library/Logs/CrashReporter";
+
+static NSString *CNCulpritBundleID(void) {
+    static NSString *bundleID = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray<NSString *> *infoPaths = @[
+            @"/var/jb/Applications/Culprit.app/Info.plist",
+            @"/Applications/Culprit.app/Info.plist"
+        ];
+        for (NSString *path in infoPaths) {
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:path];
+            NSString *candidate = [info[@"CFBundleIdentifier"] isKindOfClass:[NSString class]] ? info[@"CFBundleIdentifier"] : nil;
+            if (candidate.length) {
+                bundleID = candidate;
+                break;
+            }
+        }
+        if (!bundleID.length) bundleID = kCNFallbackBundleID;
+    });
+    return bundleID;
+}
 
 static dispatch_queue_t CNBBServerQueue(void) {
     static dispatch_queue_t queue;
@@ -69,13 +94,14 @@ static BOOL CNPostBulletin(NSString *title, NSString *message) {
     Class actionClass = NSClassFromString(@"BBAction");
     if (!bulletinClass) return NO;
 
+    NSString *culpritBundleID = CNCulpritBundleID();
     BBBulletin *bulletin = [[bulletinClass alloc] init];
     NSDate *now = [NSDate date];
     NSString *unique = [[NSProcessInfo processInfo] globallyUniqueString];
 
     bulletin.title = title;
     bulletin.message = message;
-    bulletin.sectionID = kCNSectionID;
+    bulletin.sectionID = culpritBundleID;
     bulletin.bulletinID = unique;
     bulletin.recordID = unique;
     bulletin.publisherBulletinID = unique;
@@ -86,7 +112,7 @@ static BOOL CNPostBulletin(NSString *title, NSString *message) {
     bulletin.showsMessagePreview = YES;
 
     if (actionClass && [actionClass respondsToSelector:@selector(actionWithLaunchBundleID:callblock:)]) {
-        bulletin.defaultAction = [actionClass actionWithLaunchBundleID:kCNSectionID callblock:nil];
+        bulletin.defaultAction = [actionClass actionWithLaunchBundleID:culpritBundleID callblock:nil];
     }
 
     dispatch_queue_t queue = CNBBServerQueue();
@@ -97,19 +123,16 @@ static BOOL CNPostBulletin(NSString *title, NSString *message) {
         }
     };
 
-    if (queue) {
-        dispatch_async(queue, publishBlock);
-    } else {
-        dispatch_async(dispatch_get_main_queue(), publishBlock);
-    }
+    if (queue) dispatch_async(queue, publishBlock);
+    else dispatch_async(dispatch_get_main_queue(), publishBlock);
     return YES;
 }
 
 static void CNSaveState(void) {
     if (!gRecentReports) return;
     NSArray *recent = gRecentReports.array;
-    if (recent.count > 100) {
-        recent = [recent subarrayWithRange:NSMakeRange(recent.count - 100, 100)];
+    if (recent.count > 150) {
+        recent = [recent subarrayWithRange:NSMakeRange(recent.count - 150, 150)];
     }
     NSDictionary *state = @{
         @"LastCheck": @(gLastCheck),
@@ -144,8 +167,7 @@ static NSString *CNImageCulpritName(NSDictionary *image) {
     NSString *lowerName = name.lowercaseString;
 
     BOOL injected = [lowerPath containsString:@"mobilesubstrate/dynamiclibraries/"] ||
-                    [lowerPath containsString:@"/tweakinject/"] ||
-                    [lowerPath containsString:@"/var/jb/"];
+                    [lowerPath containsString:@"/tweakinject/"];
     if (!injected) return nil;
 
     if ([lowerName containsString:@"culpritnotify"] ||
@@ -197,16 +219,19 @@ static NSString *CNCulpritFromText(NSString *text) {
     __block NSString *found = nil;
     [text enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
         NSString *lower = line.lowercaseString;
-        BOOL injected = [lower containsString:@"mobilesubstrate/dynamiclibraries/"] || [lower containsString:@"/tweakinject/"];
+        BOOL injected = [lower containsString:@"mobilesubstrate/dynamiclibraries/"] ||
+                        [lower containsString:@"/tweakinject/"];
         if (!injected || ![lower containsString:@".dylib"]) return;
 
         NSRange dylibRange = [lower rangeOfString:@".dylib"];
         if (dylibRange.location == NSNotFound) return;
         NSString *prefix = [line substringToIndex:NSMaxRange(dylibRange)];
-        NSArray *parts = [prefix componentsSeparatedByString:@"/"];
-        NSString *name = parts.lastObject;
+        NSString *name = [prefix componentsSeparatedByString:@"/"].lastObject;
         NSString *lowerName = name.lowercaseString;
-        if ([lowerName containsString:@"culpritnotify"] || [lowerName containsString:@"ellekit"] || [lowerName containsString:@"libhooker"]) return;
+        if ([lowerName containsString:@"culpritnotify"] ||
+            [lowerName containsString:@"ellekit"] ||
+            [lowerName containsString:@"libhooker"]) return;
+
         found = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         *stop = YES;
     }];
@@ -218,10 +243,6 @@ static NSString *CNFallbackProcessName(NSString *path) {
     NSRange dateRange = [name rangeOfString:@"-20"];
     if (dateRange.location != NSNotFound && dateRange.location > 0) {
         name = [name substringToIndex:dateRange.location];
-    }
-    NSRange resourceRange = [name rangeOfString:@"." options:NSBackwardsSearch];
-    if (resourceRange.location != NSNotFound && resourceRange.location > 0) {
-        name = [name substringToIndex:resourceRange.location];
     }
     return name.length ? name : @"Unknown process";
 }
@@ -267,13 +288,16 @@ static NSDictionary *CNBuildNotificationForReport(NSString *path) {
         message = @"iOS generated a memory-pressure termination report.";
     } else if ([lowerFilename containsString:@"wakeups_resource"]) {
         title = [NSString stringWithFormat:@"%@ wakeups limit", process];
-        message = @"iOS generated a wakeups resource report.";
+        message = culprit.length ? [NSString stringWithFormat:@"Resource limit • Culprit: %@", culprit]
+                                 : @"iOS generated a wakeups resource report.";
     } else if ([lowerFilename containsString:@"cpu_resource"]) {
         title = [NSString stringWithFormat:@"%@ CPU limit", process];
-        message = @"iOS generated a CPU resource report.";
+        message = culprit.length ? [NSString stringWithFormat:@"Resource limit • Culprit: %@", culprit]
+                                 : @"iOS generated a CPU resource report.";
     } else if ([lowerFilename containsString:@"memory_resource"]) {
         title = [NSString stringWithFormat:@"%@ memory limit", process];
-        message = @"iOS generated a memory resource report.";
+        message = culprit.length ? [NSString stringWithFormat:@"Resource limit • Culprit: %@", culprit]
+                                 : @"iOS generated a memory resource report.";
     } else if (exceptionType.length || body[@"faultingThread"] || body[@"threads"]) {
         title = [NSString stringWithFormat:@"%@ crashed", process];
         NSString *reason = exceptionType.length ? exceptionType : @"Crash detected";
@@ -288,75 +312,130 @@ static NSDictionary *CNBuildNotificationForReport(NSString *path) {
     return @{ @"title": title, @"message": message };
 }
 
-static NSString *CNReportKey(NSString *path, NSDictionary *attributes) {
-    NSDate *date = attributes[NSFileModificationDate];
-    NSNumber *size = attributes[NSFileSize];
-    return [NSString stringWithFormat:@"%@|%.0f|%@", path.lastPathComponent, date.timeIntervalSince1970, size ?: @0];
-}
-
 static void CNTrimRecent(void) {
-    while (gRecentReports.count > 100) {
+    while (gRecentReports.count > 150) {
         [gRecentReports removeObjectAtIndex:0];
     }
 }
 
 static void CNScanCrashReports(void) {
-    if (!gBBServer) return;
+    if (!gBBServer || !gRecentReports) return;
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *error = nil;
     NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:kCNCrashDirectory error:&error];
-    if (error || !files.count) {
-        gLastCheck = [[NSDate date] timeIntervalSince1970];
-        CNSaveState();
-        return;
-    }
+    if (error || !files.count) return;
 
-    NSArray<NSString *> *sorted = [files sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
+    NSArray<NSString *> *sorted = [files sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSString *pathA = [kCNCrashDirectory stringByAppendingPathComponent:a];
+        NSString *pathB = [kCNCrashDirectory stringByAppendingPathComponent:b];
+        NSDate *dateA = [[fm attributesOfItemAtPath:pathA error:nil] objectForKey:NSFileModificationDate];
+        NSDate *dateB = [[fm attributesOfItemAtPath:pathB error:nil] objectForKey:NSFileModificationDate];
+        return [dateA compare:dateB];
+    }];
+
+    NSTimeInterval newestSeen = gLastCheck;
     for (NSString *name in sorted) {
         NSString *lower = name.lowercaseString;
         if (![lower hasSuffix:@".ips"] && ![lower hasSuffix:@".crash"]) continue;
+        if ([gRecentReports containsObject:name]) continue;
 
         NSString *path = [kCNCrashDirectory stringByAppendingPathComponent:name];
         NSDictionary *attributes = [fm attributesOfItemAtPath:path error:nil];
         NSDate *modified = attributes[NSFileModificationDate];
-        if (!modified) continue;
+        NSNumber *size = attributes[NSFileSize];
+        if (!modified || size.unsignedLongLongValue == 0) continue;
 
         NSTimeInterval modifiedTime = modified.timeIntervalSince1970;
+        newestSeen = MAX(newestSeen, modifiedTime);
         if (modifiedTime < gLastCheck - 1.0) continue;
 
-        NSString *reportKey = CNReportKey(path, attributes);
-        if ([gRecentReports containsObject:reportKey]) continue;
+        // Give ReportCrash a fraction of a second to finish the file before parsing it.
+        if ([[NSDate date] timeIntervalSinceDate:modified] < 0.20) continue;
 
         NSDictionary *notification = CNBuildNotificationForReport(path);
         if (!notification) continue;
 
         if (CNPostBulletin(notification[@"title"], notification[@"message"])) {
-            [gRecentReports addObject:reportKey];
+            [gRecentReports addObject:name];
             CNTrimRecent();
         }
     }
 
-    gLastCheck = [[NSDate date] timeIntervalSince1970];
+    gLastCheck = MAX(newestSeen, [[NSDate date] timeIntervalSince1970] - 0.5);
     CNSaveState();
 }
 
-static void CNStartMonitor(void) {
-    if (gMonitorTimer) return;
-    CNLoadState();
-
-    gMonitorQueue = dispatch_queue_create("com.551.culpritnotify.monitor", DISPATCH_QUEUE_SERIAL);
-    gMonitorTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gMonitorQueue);
-    dispatch_source_set_timer(gMonitorTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                              3 * NSEC_PER_SEC,
-                              500 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(gMonitorTimer, ^{
+static void CNRequestScan(NSTimeInterval delay) {
+    if (!gMonitorQueue) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), gMonitorQueue, ^{
         @autoreleasepool {
             CNScanCrashReports();
         }
     });
-    dispatch_resume(gMonitorTimer);
+}
+
+static void CNStartDirectoryWatcher(void) {
+    if (gDirectorySource || gCrashDirectoryFD >= 0) return;
+
+    gCrashDirectoryFD = open(kCNCrashDirectory.fileSystemRepresentation, O_EVTONLY);
+    if (gCrashDirectoryFD < 0) return;
+
+    unsigned long mask = DISPATCH_VNODE_WRITE |
+                         DISPATCH_VNODE_EXTEND |
+                         DISPATCH_VNODE_ATTRIB |
+                         DISPATCH_VNODE_LINK |
+                         DISPATCH_VNODE_RENAME |
+                         DISPATCH_VNODE_DELETE |
+                         DISPATCH_VNODE_REVOKE;
+
+    gDirectorySource = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE,
+                                               (uintptr_t)gCrashDirectoryFD,
+                                               mask,
+                                               gMonitorQueue);
+    if (!gDirectorySource) {
+        close(gCrashDirectoryFD);
+        gCrashDirectoryFD = -1;
+        return;
+    }
+
+    dispatch_source_set_event_handler(gDirectorySource, ^{
+        // First pass is fast; second pass catches a report that was still being written.
+        CNRequestScan(0.25);
+        CNRequestScan(0.85);
+    });
+
+    dispatch_source_set_cancel_handler(gDirectorySource, ^{
+        if (gCrashDirectoryFD >= 0) {
+            close(gCrashDirectoryFD);
+            gCrashDirectoryFD = -1;
+        }
+        gDirectorySource = nil;
+    });
+
+    dispatch_resume(gDirectorySource);
+}
+
+static void CNStartMonitor(void) {
+    if (gFallbackTimer) return;
+
+    CNLoadState();
+    gMonitorQueue = dispatch_queue_create("com.551.culpritnotify.monitor", DISPATCH_QUEUE_SERIAL);
+    CNStartDirectoryWatcher();
+
+    // Safety net: if a vnode event is missed, this still catches the report quickly.
+    gFallbackTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gMonitorQueue);
+    dispatch_source_set_timer(gFallbackTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                              2 * NSEC_PER_SEC,
+                              250 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(gFallbackTimer, ^{
+        @autoreleasepool {
+            CNScanCrashReports();
+            if (!gDirectorySource) CNStartDirectoryWatcher();
+        }
+    });
+    dispatch_resume(gFallbackTimer);
 }
 
 %hook BBServer
@@ -395,13 +474,13 @@ static void CNStartMonitor(void) {
 
 %ctor {
     @autoreleasepool {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             CNStartMonitor();
         });
 
         static int testToken = 0;
         notify_register_dispatch("com.551.culpritnotify/test", &testToken, dispatch_get_main_queue(), ^(int token) {
-            CNPostBulletin(@"CulpritNotify", @"Test notification — crash monitoring is active.");
+            CNPostBulletin(@"CulpritNotify", @"Test notification — tap to open Culprit.");
         });
     }
 }
