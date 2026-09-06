@@ -59,7 +59,6 @@ static dispatch_source_t gDirectorySource;
 static NSMutableOrderedSet<NSString *> *gRecentReports;
 static int gCrashDirectoryFD = -1;
 static UIWindow *gBannerWindow = nil;
-static NSString *gBannerLaunchBundleID = nil;
 static NSUInteger gBannerGeneration = 0;
 
 static NSString *const kCNFallbackBundleID = @"jp.dcsyhi.culprit";
@@ -158,8 +157,6 @@ static void CNLaunchCulprit(void) {
         }
     });
 }
-
-static void CNHideBannerAnimated(BOOL)animated) __attribute__((unused));
 
 static void CNHideBannerAnimatedImpl(BOOL animated) {
     UIWindow *window = gBannerWindow;
