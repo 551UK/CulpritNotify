@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <notify.h>
@@ -18,25 +19,37 @@
 @property (nonatomic, strong) id defaultAction;
 @property (nonatomic, assign, getter=isClearable) BOOL clearable;
 @property (nonatomic, assign) BOOL showsMessagePreview;
+@property (nonatomic, assign) BOOL turnsOnDisplay;
 @end
 
 @interface BBAction : NSObject
 + (id)actionWithLaunchBundleID:(NSString *)bundleID callblock:(id)block;
 @end
 
+@interface BBSectionInfo : NSObject
+- (id)initWithDefaultsForSectionType:(long long)type;
+@property (nonatomic, copy) NSString *sectionID;
+@property (nonatomic, copy) NSString *displayName;
+@property (nonatomic, copy) NSString *appName;
+@property (nonatomic, assign) BOOL allowsNotifications;
+@property (nonatomic, assign) BOOL enabled;
+@property (nonatomic, assign) BOOL showsInLockScreen;
+@property (nonatomic, assign) BOOL showsInNotificationCenter;
+@property (nonatomic, assign) BOOL showsMessagePreview;
+@property (nonatomic, assign) unsigned long long alertType;
+@property (nonatomic, assign) unsigned long long pushSettings;
+@end
+
 @interface BBServer : NSObject
 - (id)initWithQueue:(id)queue;
-- (id)initWithQueue:(id)queue
- dataProviderManager:(id)dataProviderManager
-          syncService:(id)syncService
-    dismissalSyncCache:(id)dismissalSyncCache
-     observerListener:(id)observerListener
-    utilitiesListener:(id)utilitiesListener
-      conduitListener:(id)conduitListener
-  systemStateListener:(id)systemStateListener
-      settingsListener:(id)settingsListener;
 - (void)_addObserver:(id)observer;
 - (void)publishBulletin:(id)bulletin destinations:(unsigned long long)destinations;
+- (id)_sectionInfoForSectionID:(id)sectionID effective:(BOOL)effective;
+- (void)setSectionInfo:(id)sectionInfo forSectionID:(id)sectionID;
+@end
+
+@interface SpringBoard : UIApplication
+- (BOOL)launchApplicationWithIdentifier:(NSString *)identifier suspended:(BOOL)suspended;
 @end
 
 static __weak BBServer *gBBServer = nil;
@@ -44,30 +57,77 @@ static dispatch_queue_t gMonitorQueue;
 static dispatch_source_t gFallbackTimer;
 static dispatch_source_t gDirectorySource;
 static NSMutableOrderedSet<NSString *> *gRecentReports;
-static NSTimeInterval gLastCheck = 0;
 static int gCrashDirectoryFD = -1;
+static UIWindow *gBannerWindow = nil;
+static NSString *gBannerLaunchBundleID = nil;
+static NSUInteger gBannerGeneration = 0;
 
 static NSString *const kCNFallbackBundleID = @"jp.dcsyhi.culprit";
 static NSString *const kCNStatePath = @"/var/mobile/Library/Preferences/com.551.culpritnotify.state.plist";
+static NSString *const kCNLogPath = @"/var/mobile/Library/Logs/CulpritNotify.log";
 static NSString *const kCNCrashDirectory = @"/var/mobile/Library/Logs/CrashReporter";
+
+static void CNLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [formatter stringFromDate:[NSDate date]], message ?: @""];
+
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:kCNLogPath]) {
+        [data writeToFile:kCNLogPath atomically:YES];
+        return;
+    }
+
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:kCNLogPath];
+    if (!handle) return;
+    @try {
+        [handle seekToEndOfFile];
+        [handle writeData:data];
+        [handle closeFile];
+    } @catch (__unused NSException *exception) {}
+}
 
 static NSString *CNCulpritBundleID(void) {
     static NSString *bundleID = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSArray<NSString *> *infoPaths = @[
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithArray:@[
             @"/var/jb/Applications/Culprit.app/Info.plist",
             @"/Applications/Culprit.app/Info.plist"
-        ];
-        for (NSString *path in infoPaths) {
+        ]];
+
+        NSArray<NSString *> *roots = @[@"/var/jb/Applications", @"/Applications"];
+        for (NSString *root in roots) {
+            NSArray<NSString *> *items = [fm contentsOfDirectoryAtPath:root error:nil];
+            for (NSString *item in items) {
+                if ([item.lowercaseString containsString:@"culprit"] && [item.pathExtension.lowercaseString isEqualToString:@"app"]) {
+                    [paths addObject:[[root stringByAppendingPathComponent:item] stringByAppendingPathComponent:@"Info.plist"]];
+                }
+            }
+        }
+
+        for (NSString *path in paths) {
             NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:path];
             NSString *candidate = [info[@"CFBundleIdentifier"] isKindOfClass:[NSString class]] ? info[@"CFBundleIdentifier"] : nil;
             if (candidate.length) {
                 bundleID = candidate;
+                CNLog(@"Resolved Culprit bundle ID %@ from %@", bundleID, path);
                 break;
             }
         }
-        if (!bundleID.length) bundleID = kCNFallbackBundleID;
+
+        if (!bundleID.length) {
+            bundleID = kCNFallbackBundleID;
+            CNLog(@"Could not resolve Culprit app bundle ID; using fallback %@", bundleID);
+        }
     });
     return bundleID;
 }
@@ -86,15 +146,175 @@ static dispatch_queue_t CNBBServerQueue(void) {
     return queue;
 }
 
+static void CNLaunchCulprit(void) {
+    NSString *bundleID = CNCulpritBundleID();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        if ([app respondsToSelector:@selector(launchApplicationWithIdentifier:suspended:)]) {
+            [(SpringBoard *)app launchApplicationWithIdentifier:bundleID suspended:NO];
+            CNLog(@"Launch requested for Culprit (%@)", bundleID);
+        } else {
+            CNLog(@"SpringBoard launchApplicationWithIdentifier selector unavailable");
+        }
+    });
+}
+
+static void CNHideBannerAnimated(BOOL)animated) __attribute__((unused));
+
+static void CNHideBannerAnimatedImpl(BOOL animated) {
+    UIWindow *window = gBannerWindow;
+    if (!window) return;
+    gBannerWindow = nil;
+
+    void (^finish)(void) = ^{
+        window.hidden = YES;
+        window.rootViewController = nil;
+    };
+
+    if (!animated) {
+        finish();
+        return;
+    }
+
+    [UIView animateWithDuration:0.22 animations:^{
+        CGRect frame = window.frame;
+        frame.origin.y = -frame.size.height - 20.0;
+        window.frame = frame;
+        window.alpha = 0.0;
+    } completion:^(__unused BOOL finished) {
+        finish();
+    }];
+}
+
+@interface CNBannerTapTarget : NSObject
+@end
+
+@implementation CNBannerTapTarget
+- (void)handleTap:(UITapGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateEnded) return;
+    CNHideBannerAnimatedImpl(YES);
+    CNLaunchCulprit();
+}
+@end
+
+static CNBannerTapTarget *gBannerTapTarget = nil;
+
+static void CNShowSpringBoardBanner(NSString *title, NSString *message) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gBannerGeneration++;
+        NSUInteger generation = gBannerGeneration;
+
+        if (gBannerWindow) CNHideBannerAnimatedImpl(NO);
+
+        UIScreen *screen = [UIScreen mainScreen];
+        CGFloat width = MIN(screen.bounds.size.width - 20.0, 520.0);
+        CGFloat height = 92.0;
+        CGFloat x = (screen.bounds.size.width - width) / 2.0;
+        CGRect hiddenFrame = CGRectMake(x, -height - 20.0, width, height);
+        CGRect shownFrame = CGRectMake(x, 10.0, width, height);
+
+        UIWindow *window = [[UIWindow alloc] initWithFrame:hiddenFrame];
+        window.windowLevel = UIWindowLevelAlert + 1000.0;
+        window.backgroundColor = UIColor.clearColor;
+        window.alpha = 0.0;
+
+        UIViewController *controller = [[UIViewController alloc] init];
+        controller.view.backgroundColor = UIColor.clearColor;
+        window.rootViewController = controller;
+
+        UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+        blur.frame = controller.view.bounds;
+        blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        blur.layer.cornerRadius = 18.0;
+        blur.layer.masksToBounds = YES;
+        [controller.view addSubview:blur];
+
+        UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(16.0, 12.0, width - 32.0, 24.0)];
+        titleLabel.text = title ?: @"Crash detected";
+        titleLabel.textColor = UIColor.whiteColor;
+        titleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightSemibold];
+        titleLabel.numberOfLines = 1;
+        [blur.contentView addSubview:titleLabel];
+
+        UILabel *messageLabel = [[UILabel alloc] initWithFrame:CGRectMake(16.0, 37.0, width - 32.0, 43.0)];
+        messageLabel.text = message ?: @"Tap to open Culprit";
+        messageLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.82];
+        messageLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
+        messageLabel.numberOfLines = 2;
+        [blur.contentView addSubview:messageLabel];
+
+        if (!gBannerTapTarget) gBannerTapTarget = [[CNBannerTapTarget alloc] init];
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:gBannerTapTarget action:@selector(handleTap:)];
+        [controller.view addGestureRecognizer:tap];
+
+        gBannerWindow = window;
+        window.hidden = NO;
+
+        [UIView animateWithDuration:0.28 delay:0.0 usingSpringWithDamping:0.82 initialSpringVelocity:0.2 options:UIViewAnimationOptionCurveEaseOut animations:^{
+            window.frame = shownFrame;
+            window.alpha = 1.0;
+        } completion:nil];
+
+        CNLog(@"Displayed SpringBoard banner: %@ | %@", title, message);
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            if (generation == gBannerGeneration && gBannerWindow == window) {
+                CNHideBannerAnimatedImpl(YES);
+            }
+        });
+    });
+}
+
+static void CNEnsureNotificationSection(BBServer *server, NSString *sectionID) {
+    if (!server || !sectionID.length) return;
+    @try {
+        BBSectionInfo *info = nil;
+        if ([server respondsToSelector:@selector(_sectionInfoForSectionID:effective:)]) {
+            info = [server _sectionInfoForSectionID:sectionID effective:NO];
+        }
+        if (!info) {
+            Class sectionClass = NSClassFromString(@"BBSectionInfo");
+            if (sectionClass) info = [[sectionClass alloc] initWithDefaultsForSectionType:0];
+        }
+        if (!info) return;
+
+        info.sectionID = sectionID;
+        info.displayName = @"Culprit";
+        info.appName = @"Culprit";
+        info.allowsNotifications = YES;
+        info.enabled = YES;
+        info.showsInLockScreen = YES;
+        info.showsInNotificationCenter = YES;
+        info.showsMessagePreview = YES;
+        info.alertType = 1;
+        info.pushSettings = 63;
+
+        if ([server respondsToSelector:@selector(setSectionInfo:forSectionID:)]) {
+            [server setSectionInfo:info forSectionID:sectionID];
+            CNLog(@"Ensured BulletinBoard section for %@", sectionID);
+        }
+    } @catch (NSException *exception) {
+        CNLog(@"Unable to configure BulletinBoard section: %@", exception.reason);
+    }
+}
+
 static BOOL CNPostBulletin(NSString *title, NSString *message) {
     BBServer *server = gBBServer;
-    if (!server || !title.length || !message.length) return NO;
+    if (!server || !title.length || !message.length) {
+        CNLog(@"Bulletin skipped because BBServer is unavailable");
+        return NO;
+    }
 
     Class bulletinClass = NSClassFromString(@"BBBulletin");
     Class actionClass = NSClassFromString(@"BBAction");
-    if (!bulletinClass) return NO;
+    if (!bulletinClass) {
+        CNLog(@"Bulletin skipped because BBBulletin class is unavailable");
+        return NO;
+    }
 
     NSString *culpritBundleID = CNCulpritBundleID();
+    CNEnsureNotificationSection(server, culpritBundleID);
+
     BBBulletin *bulletin = [[bulletinClass alloc] init];
     NSDate *now = [NSDate date];
     NSString *unique = [[NSProcessInfo processInfo] globallyUniqueString];
@@ -110,6 +330,7 @@ static BOOL CNPostBulletin(NSString *title, NSString *message) {
     bulletin.lastInterruptDate = now;
     bulletin.clearable = YES;
     bulletin.showsMessagePreview = YES;
+    bulletin.turnsOnDisplay = YES;
 
     if (actionClass && [actionClass respondsToSelector:@selector(actionWithLaunchBundleID:callblock:)]) {
         bulletin.defaultAction = [actionClass actionWithLaunchBundleID:culpritBundleID callblock:nil];
@@ -120,6 +341,7 @@ static BOOL CNPostBulletin(NSString *title, NSString *message) {
         BBServer *currentServer = gBBServer;
         if (currentServer && [currentServer respondsToSelector:@selector(publishBulletin:destinations:)]) {
             [currentServer publishBulletin:bulletin destinations:15];
+            CNLog(@"Published BulletinBoard notification: %@", title);
         }
     };
 
@@ -128,14 +350,25 @@ static BOOL CNPostBulletin(NSString *title, NSString *message) {
     return YES;
 }
 
+static NSArray<NSString *> *CNCurrentReportNames(void) {
+    NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:kCNCrashDirectory error:nil];
+    if (!files) return @[];
+    NSMutableArray<NSString *> *reports = [NSMutableArray array];
+    for (NSString *name in files) {
+        NSString *lower = name.lowercaseString;
+        if ([lower hasSuffix:@".ips"] || [lower hasSuffix:@".crash"]) [reports addObject:name];
+    }
+    return reports;
+}
+
 static void CNSaveState(void) {
     if (!gRecentReports) return;
     NSArray *recent = gRecentReports.array;
-    if (recent.count > 150) {
-        recent = [recent subarrayWithRange:NSMakeRange(recent.count - 150, 150)];
+    if (recent.count > 500) {
+        recent = [recent subarrayWithRange:NSMakeRange(recent.count - 500, 500)];
     }
     NSDictionary *state = @{
-        @"LastCheck": @(gLastCheck),
+        @"StateVersion": @2,
         @"RecentReports": recent ?: @[]
     };
     [state writeToFile:kCNStatePath atomically:YES];
@@ -143,14 +376,16 @@ static void CNSaveState(void) {
 
 static void CNLoadState(void) {
     NSDictionary *state = [NSDictionary dictionaryWithContentsOfFile:kCNStatePath];
-    NSArray *recent = [state[@"RecentReports"] isKindOfClass:[NSArray class]] ? state[@"RecentReports"] : @[];
-    gRecentReports = [[NSMutableOrderedSet alloc] initWithArray:recent];
-    gLastCheck = [state[@"LastCheck"] doubleValue];
+    NSInteger version = [state[@"StateVersion"] integerValue];
+    NSArray *recent = [state[@"RecentReports"] isKindOfClass:[NSArray class]] ? state[@"RecentReports"] : nil;
 
-    if (gLastCheck <= 0) {
-        gLastCheck = [[NSDate date] timeIntervalSince1970];
-        CNSaveState();
+    if (version != 2 || !recent) {
+        recent = CNCurrentReportNames();
+        CNLog(@"Initialised state with %lu existing crash reports", (unsigned long)recent.count);
     }
+
+    gRecentReports = [[NSMutableOrderedSet alloc] initWithArray:recent ?: @[]];
+    CNSaveState();
 }
 
 static NSDictionary *CNJSONDictionary(NSData *data) {
@@ -285,19 +520,19 @@ static NSDictionary *CNBuildNotificationForReport(NSString *path) {
     if ([lowerFilename containsString:@"jetsamevent"]) {
         NSString *largest = [body[@"largestProcess"] isKindOfClass:[NSString class]] ? body[@"largestProcess"] : nil;
         title = largest.length ? [NSString stringWithFormat:@"Jetsam: %@", largest] : @"Jetsam event";
-        message = @"iOS generated a memory-pressure termination report.";
+        message = @"Memory-pressure termination. Tap to open Culprit.";
     } else if ([lowerFilename containsString:@"wakeups_resource"]) {
         title = [NSString stringWithFormat:@"%@ wakeups limit", process];
-        message = culprit.length ? [NSString stringWithFormat:@"Resource limit • Culprit: %@", culprit]
-                                 : @"iOS generated a wakeups resource report.";
+        message = culprit.length ? [NSString stringWithFormat:@"Culprit: %@", culprit]
+                                 : @"Wakeups resource report. Tap to open Culprit.";
     } else if ([lowerFilename containsString:@"cpu_resource"]) {
         title = [NSString stringWithFormat:@"%@ CPU limit", process];
-        message = culprit.length ? [NSString stringWithFormat:@"Resource limit • Culprit: %@", culprit]
-                                 : @"iOS generated a CPU resource report.";
+        message = culprit.length ? [NSString stringWithFormat:@"Culprit: %@", culprit]
+                                 : @"CPU resource report. Tap to open Culprit.";
     } else if ([lowerFilename containsString:@"memory_resource"]) {
         title = [NSString stringWithFormat:@"%@ memory limit", process];
-        message = culprit.length ? [NSString stringWithFormat:@"Resource limit • Culprit: %@", culprit]
-                                 : @"iOS generated a memory resource report.";
+        message = culprit.length ? [NSString stringWithFormat:@"Culprit: %@", culprit]
+                                 : @"Memory resource report. Tap to open Culprit.";
     } else if (exceptionType.length || body[@"faultingThread"] || body[@"threads"]) {
         title = [NSString stringWithFormat:@"%@ crashed", process];
         NSString *reason = exceptionType.length ? exceptionType : @"Crash detected";
@@ -305,65 +540,62 @@ static NSDictionary *CNBuildNotificationForReport(NSString *path) {
                                  : [NSString stringWithFormat:@"%@ • Culprit: Unknown", reason];
     } else {
         title = [NSString stringWithFormat:@"%@ crash report", process];
-        message = bugType.length ? [NSString stringWithFormat:@"New iOS crash report (bug type %@).", bugType]
-                                 : @"New iOS crash report detected.";
+        message = bugType.length ? [NSString stringWithFormat:@"New crash report (bug type %@). Tap to open Culprit.", bugType]
+                                 : @"New crash report detected. Tap to open Culprit.";
     }
 
-    return @{ @"title": title, @"message": message };
+    return @{ @"title": title ?: @"Crash detected", @"message": message ?: @"Tap to open Culprit" };
 }
 
 static void CNTrimRecent(void) {
-    while (gRecentReports.count > 150) {
-        [gRecentReports removeObjectAtIndex:0];
-    }
+    while (gRecentReports.count > 500) [gRecentReports removeObjectAtIndex:0];
+}
+
+static void CNDeliverCrashAlert(NSDictionary *notification, NSString *reportName) {
+    NSString *title = notification[@"title"] ?: @"Crash detected";
+    NSString *message = notification[@"message"] ?: @"Tap to open Culprit";
+    CNLog(@"Delivering alert for %@: %@ | %@", reportName, title, message);
+
+    CNShowSpringBoardBanner(title, message);
+    CNPostBulletin(title, message);
 }
 
 static void CNScanCrashReports(void) {
-    if (!gBBServer || !gRecentReports) return;
+    if (!gRecentReports) return;
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *error = nil;
     NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:kCNCrashDirectory error:&error];
-    if (error || !files.count) return;
+    if (error) {
+        CNLog(@"CrashReporter scan failed: %@", error.localizedDescription);
+        return;
+    }
 
-    NSArray<NSString *> *sorted = [files sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-        NSString *pathA = [kCNCrashDirectory stringByAppendingPathComponent:a];
-        NSString *pathB = [kCNCrashDirectory stringByAppendingPathComponent:b];
-        NSDate *dateA = [[fm attributesOfItemAtPath:pathA error:nil] objectForKey:NSFileModificationDate];
-        NSDate *dateB = [[fm attributesOfItemAtPath:pathB error:nil] objectForKey:NSFileModificationDate];
-        return [dateA compare:dateB];
-    }];
-
-    NSTimeInterval newestSeen = gLastCheck;
-    for (NSString *name in sorted) {
+    for (NSString *name in files) {
         NSString *lower = name.lowercaseString;
         if (![lower hasSuffix:@".ips"] && ![lower hasSuffix:@".crash"]) continue;
         if ([gRecentReports containsObject:name]) continue;
 
         NSString *path = [kCNCrashDirectory stringByAppendingPathComponent:name];
         NSDictionary *attributes = [fm attributesOfItemAtPath:path error:nil];
-        NSDate *modified = attributes[NSFileModificationDate];
         NSNumber *size = attributes[NSFileSize];
-        if (!modified || size.unsignedLongLongValue == 0) continue;
+        NSDate *modified = attributes[NSFileModificationDate];
+        if (!size || size.unsignedLongLongValue == 0 || !modified) continue;
 
-        NSTimeInterval modifiedTime = modified.timeIntervalSince1970;
-        newestSeen = MAX(newestSeen, modifiedTime);
-        if (modifiedTime < gLastCheck - 1.0) continue;
-
-        // Give ReportCrash a fraction of a second to finish the file before parsing it.
-        if ([[NSDate date] timeIntervalSinceDate:modified] < 0.20) continue;
+        NSTimeInterval age = [[NSDate date] timeIntervalSinceDate:modified];
+        if (age < 0.15) continue;
 
         NSDictionary *notification = CNBuildNotificationForReport(path);
-        if (!notification) continue;
-
-        if (CNPostBulletin(notification[@"title"], notification[@"message"])) {
-            [gRecentReports addObject:name];
-            CNTrimRecent();
+        if (!notification) {
+            CNLog(@"Report not ready yet: %@ (%@ bytes)", name, size);
+            continue;
         }
-    }
 
-    gLastCheck = MAX(newestSeen, [[NSDate date] timeIntervalSince1970] - 0.5);
-    CNSaveState();
+        [gRecentReports addObject:name];
+        CNTrimRecent();
+        CNSaveState();
+        CNDeliverCrashAlert(notification, name);
+    }
 }
 
 static void CNRequestScan(NSTimeInterval delay) {
@@ -379,7 +611,10 @@ static void CNStartDirectoryWatcher(void) {
     if (gDirectorySource || gCrashDirectoryFD >= 0) return;
 
     gCrashDirectoryFD = open(kCNCrashDirectory.fileSystemRepresentation, O_EVTONLY);
-    if (gCrashDirectoryFD < 0) return;
+    if (gCrashDirectoryFD < 0) {
+        CNLog(@"Could not open CrashReporter directory for vnode watching (errno %d)", errno);
+        return;
+    }
 
     unsigned long mask = DISPATCH_VNODE_WRITE |
                          DISPATCH_VNODE_EXTEND |
@@ -396,13 +631,15 @@ static void CNStartDirectoryWatcher(void) {
     if (!gDirectorySource) {
         close(gCrashDirectoryFD);
         gCrashDirectoryFD = -1;
+        CNLog(@"Failed to create CrashReporter vnode source");
         return;
     }
 
     dispatch_source_set_event_handler(gDirectorySource, ^{
-        // First pass is fast; second pass catches a report that was still being written.
-        CNRequestScan(0.25);
-        CNRequestScan(0.85);
+        CNLog(@"CrashReporter directory changed");
+        CNRequestScan(0.10);
+        CNRequestScan(0.35);
+        CNRequestScan(0.80);
     });
 
     dispatch_source_set_cancel_handler(gDirectorySource, ^{
@@ -411,9 +648,11 @@ static void CNStartDirectoryWatcher(void) {
             gCrashDirectoryFD = -1;
         }
         gDirectorySource = nil;
+        CNLog(@"CrashReporter vnode source cancelled");
     });
 
     dispatch_resume(gDirectorySource);
+    CNLog(@"CrashReporter vnode watcher active");
 }
 
 static void CNStartMonitor(void) {
@@ -421,14 +660,14 @@ static void CNStartMonitor(void) {
 
     CNLoadState();
     gMonitorQueue = dispatch_queue_create("com.551.culpritnotify.monitor", DISPATCH_QUEUE_SERIAL);
+    CNLog(@"CulpritNotify monitor starting");
     CNStartDirectoryWatcher();
 
-    // Safety net: if a vnode event is missed, this still catches the report quickly.
     gFallbackTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gMonitorQueue);
     dispatch_source_set_timer(gFallbackTimer,
                               dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
-                              2 * NSEC_PER_SEC,
-                              250 * NSEC_PER_MSEC);
+                              1 * NSEC_PER_SEC,
+                              150 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(gFallbackTimer, ^{
         @autoreleasepool {
             CNScanCrashReports();
@@ -443,25 +682,13 @@ static void CNStartMonitor(void) {
 - (id)initWithQueue:(id)queue {
     id result = %orig;
     gBBServer = result;
-    return result;
-}
-
-- (id)initWithQueue:(id)queue
- dataProviderManager:(id)dataProviderManager
-          syncService:(id)syncService
-    dismissalSyncCache:(id)dismissalSyncCache
-     observerListener:(id)observerListener
-    utilitiesListener:(id)utilitiesListener
-      conduitListener:(id)conduitListener
-  systemStateListener:(id)systemStateListener
-      settingsListener:(id)settingsListener {
-    id result = %orig;
-    gBBServer = result;
+    CNLog(@"Captured BBServer from initWithQueue");
     return result;
 }
 
 - (void)_addObserver:(id)observer {
     gBBServer = self;
+    CNLog(@"Captured BBServer from _addObserver");
     %orig;
 }
 
@@ -474,13 +701,15 @@ static void CNStartMonitor(void) {
 
 %ctor {
     @autoreleasepool {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        CNLog(@"CulpritNotify dylib loaded in %@", [NSProcessInfo processInfo].processName);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             CNStartMonitor();
         });
 
         static int testToken = 0;
-        notify_register_dispatch("com.551.culpritnotify/test", &testToken, dispatch_get_main_queue(), ^(int token) {
-            CNPostBulletin(@"CulpritNotify", @"Test notification — tap to open Culprit.");
+        notify_register_dispatch("com.551.culpritnotify/test", &testToken, dispatch_get_main_queue(), ^(__unused int token) {
+            CNShowSpringBoardBanner(@"CulpritNotify test", @"Monitoring is active. Tap to open Culprit.");
+            CNPostBulletin(@"CulpritNotify test", @"Monitoring is active. Tap to open Culprit.");
         });
     }
 }
