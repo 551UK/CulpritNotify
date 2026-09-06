@@ -8,6 +8,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = CulpritNotify
 CulpritNotify_FILES = Tweak.xm
 CulpritNotify_CFLAGS = -fobjc-arc
-CulpritNotify_FRAMEWORKS = Foundation
+CulpritNotify_FRAMEWORKS = Foundation UIKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk
