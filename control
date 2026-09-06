@@ -1,8 +1,8 @@
 Package: com.551.culpritnotify
 Name: CulpritNotify
-Version: 1.0.1
+Version: 1.0.2
 Architecture: iphoneos-arm64
-Description: Instant crash notifications for Culprit.
+Description: Instant crash banners and notifications for Culprit.
 Maintainer: 551
 Author: 551
 Section: Tweaks
