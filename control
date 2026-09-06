@@ -1,0 +1,9 @@
+Package: com.551.culpritnotify
+Name: CulpritNotify
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Crash notifications for Culprit.
+Maintainer: 551
+Author: 551
+Section: Tweaks
+Depends: mobilesubstrate, jp.dcsyhi.culprit
