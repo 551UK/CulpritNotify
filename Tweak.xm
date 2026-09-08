@@ -48,18 +48,13 @@
 - (void)setSectionInfo:(id)sectionInfo forSectionID:(id)sectionID;
 @end
 
-@interface SpringBoard : UIApplication
-- (BOOL)launchApplicationWithIdentifier:(NSString *)identifier suspended:(BOOL)suspended;
-@end
-
 static __weak BBServer *gBBServer = nil;
 static dispatch_queue_t gMonitorQueue;
 static dispatch_source_t gFallbackTimer;
 static dispatch_source_t gDirectorySource;
 static NSMutableOrderedSet<NSString *> *gRecentReports;
 static int gCrashDirectoryFD = -1;
-static UIWindow *gBannerWindow = nil;
-static NSUInteger gBannerGeneration = 0;
+static dispatch_queue_t gBBQueue;
 
 static NSString *const kCNFallbackBundleID = @"jp.dcsyhi.culprit";
 static NSString *const kCNStatePath = @"/var/mobile/Library/Preferences/com.551.culpritnotify.state.plist";
@@ -131,135 +126,13 @@ static NSString *CNCulpritBundleID(void) {
     return bundleID;
 }
 
+// Resolve each time: BulletinBoard may not have initialized its queue at load time.
+// Never substitute the main queue or the report-monitor queue.
 static dispatch_queue_t CNBBServerQueue(void) {
-    static dispatch_queue_t queue;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        void *handle = dlopen(NULL, RTLD_GLOBAL);
-        if (handle) {
-            dispatch_queue_t __weak *pointer = (__weak dispatch_queue_t *)dlsym(handle, "__BBServerQueue");
-            if (pointer) queue = *pointer;
-            dlclose(handle);
-        }
-    });
-    return queue;
-}
-
-static void CNLaunchCulprit(void) {
-    NSString *bundleID = CNCulpritBundleID();
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIApplication *app = [UIApplication sharedApplication];
-        if ([app respondsToSelector:@selector(launchApplicationWithIdentifier:suspended:)]) {
-            [(SpringBoard *)app launchApplicationWithIdentifier:bundleID suspended:NO];
-            CNLog(@"Launch requested for Culprit (%@)", bundleID);
-        } else {
-            CNLog(@"SpringBoard launchApplicationWithIdentifier selector unavailable");
-        }
-    });
-}
-
-static void CNHideBannerAnimatedImpl(BOOL animated) {
-    UIWindow *window = gBannerWindow;
-    if (!window) return;
-    gBannerWindow = nil;
-
-    void (^finish)(void) = ^{
-        window.hidden = YES;
-        window.rootViewController = nil;
-    };
-
-    if (!animated) {
-        finish();
-        return;
-    }
-
-    [UIView animateWithDuration:0.22 animations:^{
-        CGRect frame = window.frame;
-        frame.origin.y = -frame.size.height - 20.0;
-        window.frame = frame;
-        window.alpha = 0.0;
-    } completion:^(__unused BOOL finished) {
-        finish();
-    }];
-}
-
-@interface CNBannerTapTarget : NSObject
-@end
-
-@implementation CNBannerTapTarget
-- (void)handleTap:(UITapGestureRecognizer *)recognizer {
-    if (recognizer.state != UIGestureRecognizerStateEnded) return;
-    CNHideBannerAnimatedImpl(YES);
-    CNLaunchCulprit();
-}
-@end
-
-static CNBannerTapTarget *gBannerTapTarget = nil;
-
-static void CNShowSpringBoardBanner(NSString *title, NSString *message) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        gBannerGeneration++;
-        NSUInteger generation = gBannerGeneration;
-
-        if (gBannerWindow) CNHideBannerAnimatedImpl(NO);
-
-        UIScreen *screen = [UIScreen mainScreen];
-        CGFloat width = MIN(screen.bounds.size.width - 20.0, 520.0);
-        CGFloat height = 92.0;
-        CGFloat x = (screen.bounds.size.width - width) / 2.0;
-        CGRect hiddenFrame = CGRectMake(x, -height - 20.0, width, height);
-        CGRect shownFrame = CGRectMake(x, 10.0, width, height);
-
-        UIWindow *window = [[UIWindow alloc] initWithFrame:hiddenFrame];
-        window.windowLevel = UIWindowLevelAlert + 1000.0;
-        window.backgroundColor = UIColor.clearColor;
-        window.alpha = 0.0;
-
-        UIViewController *controller = [[UIViewController alloc] init];
-        controller.view.backgroundColor = UIColor.clearColor;
-        window.rootViewController = controller;
-
-        UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
-        blur.frame = controller.view.bounds;
-        blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        blur.layer.cornerRadius = 18.0;
-        blur.layer.masksToBounds = YES;
-        [controller.view addSubview:blur];
-
-        UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(16.0, 12.0, width - 32.0, 24.0)];
-        titleLabel.text = title ?: @"Crash detected";
-        titleLabel.textColor = UIColor.whiteColor;
-        titleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightSemibold];
-        titleLabel.numberOfLines = 1;
-        [blur.contentView addSubview:titleLabel];
-
-        UILabel *messageLabel = [[UILabel alloc] initWithFrame:CGRectMake(16.0, 37.0, width - 32.0, 43.0)];
-        messageLabel.text = message ?: @"Tap to open Culprit";
-        messageLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.82];
-        messageLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
-        messageLabel.numberOfLines = 2;
-        [blur.contentView addSubview:messageLabel];
-
-        if (!gBannerTapTarget) gBannerTapTarget = [[CNBannerTapTarget alloc] init];
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:gBannerTapTarget action:@selector(handleTap:)];
-        [controller.view addGestureRecognizer:tap];
-
-        gBannerWindow = window;
-        window.hidden = NO;
-
-        [UIView animateWithDuration:0.28 delay:0.0 usingSpringWithDamping:0.82 initialSpringVelocity:0.2 options:UIViewAnimationOptionCurveEaseOut animations:^{
-            window.frame = shownFrame;
-            window.alpha = 1.0;
-        } completion:nil];
-
-        CNLog(@"Displayed SpringBoard banner: %@ | %@", title, message);
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            if (generation == gBannerGeneration && gBannerWindow == window) {
-                CNHideBannerAnimatedImpl(YES);
-            }
-        });
-    });
+    dispatch_queue_t __unsafe_unretained *pointer =
+        (dispatch_queue_t __unsafe_unretained *)dlsym(RTLD_DEFAULT, "__BBServerQueue");
+    if (pointer && *pointer) return *pointer;
+    return gBBQueue; // Captured from BBServer's initializer, under the server lock.
 }
 
 static void CNEnsureNotificationSection(BBServer *server, NSString *sectionID) {
@@ -295,56 +168,74 @@ static void CNEnsureNotificationSection(BBServer *server, NSString *sectionID) {
     }
 }
 
-static BOOL CNPostBulletin(NSString *title, NSString *message) {
-    BBServer *server = gBBServer;
-    if (!server || !title.length || !message.length) {
-        CNLog(@"Bulletin skipped because BBServer is unavailable");
-        return NO;
+static void CNPostBulletin(NSString *title, NSString *message, NSUInteger attempt) {
+    if (!title.length || !message.length) return;
+    BBServer *server;
+    dispatch_queue_t queue;
+    @synchronized(NSClassFromString(@"BBServer")) {
+        server = gBBServer;
+        queue = CNBBServerQueue();
     }
-
-    Class bulletinClass = NSClassFromString(@"BBBulletin");
-    Class actionClass = NSClassFromString(@"BBAction");
-    if (!bulletinClass) {
-        CNLog(@"Bulletin skipped because BBBulletin class is unavailable");
-        return NO;
-    }
-
-    NSString *culpritBundleID = CNCulpritBundleID();
-    CNEnsureNotificationSection(server, culpritBundleID);
-
-    BBBulletin *bulletin = [[bulletinClass alloc] init];
-    NSDate *now = [NSDate date];
-    NSString *unique = [[NSProcessInfo processInfo] globallyUniqueString];
-
-    bulletin.title = title;
-    bulletin.message = message;
-    bulletin.sectionID = culpritBundleID;
-    bulletin.bulletinID = unique;
-    bulletin.recordID = unique;
-    bulletin.publisherBulletinID = unique;
-    bulletin.date = now;
-    bulletin.publicationDate = now;
-    bulletin.lastInterruptDate = now;
-    bulletin.clearable = YES;
-    bulletin.showsMessagePreview = YES;
-    bulletin.turnsOnDisplay = YES;
-
-    if (actionClass && [actionClass respondsToSelector:@selector(actionWithLaunchBundleID:callblock:)]) {
-        bulletin.defaultAction = [actionClass actionWithLaunchBundleID:culpritBundleID callblock:nil];
-    }
-
-    dispatch_queue_t queue = CNBBServerQueue();
-    void (^publishBlock)(void) = ^{
-        BBServer *currentServer = gBBServer;
-        if (currentServer && [currentServer respondsToSelector:@selector(publishBulletin:destinations:)]) {
-            [currentServer publishBulletin:bulletin destinations:15];
-            CNLog(@"Published BulletinBoard notification: %@", title);
+    if (!server || !queue) {
+        if (attempt < 15) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                CNPostBulletin(title, message, attempt + 1);
+            });
+        } else {
+            CNLog(@"Notification skipped: BulletinBoard server/queue unavailable after retries");
         }
-    };
+        return;
+    }
 
-    if (queue) dispatch_async(queue, publishBlock);
-    else dispatch_async(dispatch_get_main_queue(), publishBlock);
-    return YES;
+    dispatch_async(queue, ^{
+        @synchronized(NSClassFromString(@"BBServer")) {
+            if (gBBServer != server) {
+                CNLog(@"Notification skipped: BulletinBoard server changed");
+                return;
+            }
+        }
+        // Section lookup asserts queue affinity; setup AND publishing belong here.
+        @try {
+            Class bulletinClass = NSClassFromString(@"BBBulletin");
+            Class actionClass = NSClassFromString(@"BBAction");
+            if (!bulletinClass) {
+                CNLog(@"Bulletin skipped because BBBulletin class is unavailable");
+                return;
+            }
+
+            NSString *culpritBundleID = CNCulpritBundleID();
+            CNEnsureNotificationSection(server, culpritBundleID);
+
+            BBBulletin *bulletin = [[bulletinClass alloc] init];
+            NSDate *now = [NSDate date];
+            NSString *unique = [[NSProcessInfo processInfo] globallyUniqueString];
+
+            bulletin.title = title;
+            bulletin.message = message;
+            bulletin.sectionID = culpritBundleID;
+            bulletin.bulletinID = unique;
+            bulletin.recordID = unique;
+            bulletin.publisherBulletinID = unique;
+            bulletin.date = now;
+            bulletin.publicationDate = now;
+            bulletin.lastInterruptDate = now;
+            bulletin.clearable = YES;
+            bulletin.showsMessagePreview = YES;
+            bulletin.turnsOnDisplay = YES;
+
+            if (actionClass && [actionClass respondsToSelector:@selector(actionWithLaunchBundleID:callblock:)]) {
+                bulletin.defaultAction = [actionClass actionWithLaunchBundleID:culpritBundleID callblock:nil];
+            }
+
+            if ([server respondsToSelector:@selector(publishBulletin:destinations:)]) {
+                [server publishBulletin:bulletin destinations:15];
+                CNLog(@"Published BulletinBoard notification: %@", title);
+            }
+        } @catch (NSException *exception) {
+            CNLog(@"Notification delivery failed: %@", exception.reason);
+        }
+    });
 }
 
 static NSArray<NSString *> *CNCurrentReportNames(void) {
@@ -553,8 +444,7 @@ static void CNDeliverCrashAlert(NSDictionary *notification, NSString *reportName
     NSString *message = notification[@"message"] ?: @"Tap to open Culprit";
     CNLog(@"Delivering alert for %@: %@ | %@", reportName, title, message);
 
-    CNShowSpringBoardBanner(title, message);
-    CNPostBulletin(title, message);
+    CNPostBulletin(title, message, 0);
 }
 
 static void CNScanCrashReports(void) {
@@ -678,19 +568,17 @@ static void CNStartMonitor(void) {
 
 - (id)initWithQueue:(id)queue {
     id result = %orig;
-    gBBServer = result;
+    @synchronized(NSClassFromString(@"BBServer")) {
+        gBBServer = result;
+        if (result) gBBQueue = queue;
+    }
     CNLog(@"Captured BBServer from initWithQueue");
     return result;
 }
 
 - (void)_addObserver:(id)observer {
-    gBBServer = self;
+    @synchronized(NSClassFromString(@"BBServer")) { gBBServer = self; }
     CNLog(@"Captured BBServer from _addObserver");
-    %orig;
-}
-
-- (void)dealloc {
-    if (gBBServer == self) gBBServer = nil;
     %orig;
 }
 
@@ -705,8 +593,7 @@ static void CNStartMonitor(void) {
 
         static int testToken = 0;
         notify_register_dispatch("com.551.culpritnotify/test", &testToken, dispatch_get_main_queue(), ^(__unused int token) {
-            CNShowSpringBoardBanner(@"CulpritNotify test", @"Monitoring is active. Tap to open Culprit.");
-            CNPostBulletin(@"CulpritNotify test", @"Monitoring is active. Tap to open Culprit.");
+            CNPostBulletin(@"CulpritNotify test", @"Monitoring is active. Tap to open Culprit.", 0);
         });
     }
 }

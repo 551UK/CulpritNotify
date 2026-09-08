@@ -2,6 +2,8 @@ name: Build rootless deb
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
 
@@ -9,7 +11,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: culpritnotify-release
+  group: culpritnotify-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,32 +34,22 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CulpritNotify-rootless-v1.0.2
+          name: CulpritNotify-rootless-v1.0.3
           path: packages/*.deb
           if-no-files-found: error
 
       - name: Publish GitHub Release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: ncipollo/release-action@v1
         with:
-          tag: v1.0.2
-          name: CulpritNotify v1.0.2
+          tag: v1.0.3
+          name: CulpritNotify v1.0.3
           body: |
-            Fixes crash detection when BBServer is unavailable.
-            Adds an independent SpringBoard crash banner fallback.
-            Tap the banner or notification to open Culprit.
-            Adds /var/mobile/Library/Logs/CulpritNotify.log for diagnostics.
+            Fixes notification delivery accessing BulletinBoard from the wrong queue.
+            Removes the custom SpringBoard window involved in the reported crash.
+            Uses native iOS notifications with tap-to-open Culprit.
           artifacts: packages/*.deb
           artifactErrorsFailBuild: true
           allowUpdates: true
           replacesArtifacts: true
           makeLatest: true
-
-      - name: Remove older releases
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api --paginate "repos/${{ github.repository }}/releases" --jq '.[] | [.id, .tag_name] | @tsv' | while IFS=$'\t' read -r id tag; do
-            if [ "$tag" != "v1.0.2" ]; then
-              gh api --method DELETE "repos/${{ github.repository }}/releases/$id"
-            fi
-          done
