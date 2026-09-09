@@ -22,6 +22,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Test report classification
+        run: python3 tests/test_reports.py
+
       - name: Set up Theos
         uses: Randomblock1/theos-action@v1
         with:
@@ -34,7 +37,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CulpritNotify-rootless-v1.0.3
+          name: CulpritNotify-rootless-v1.0.4
           path: packages/*.deb
           if-no-files-found: error
 
@@ -42,12 +45,11 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: ncipollo/release-action@v1
         with:
-          tag: v1.0.3
-          name: CulpritNotify v1.0.3
+          tag: v1.0.4
+          name: CulpritNotify v1.0.4
           body: |
-            Fixes notification delivery accessing BulletinBoard from the wrong queue.
-            Removes the custom SpringBoard window involved in the reported crash.
-            Uses native iOS notifications with tap-to-open Culprit.
+            Labels nonfatal resource reports as warnings and explains when iOS took no action.
+            Keeps native crash notifications and tap-to-open Culprit.
           artifacts: packages/*.deb
           artifactErrorsFailBuild: true
           allowUpdates: true

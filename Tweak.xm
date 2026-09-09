@@ -370,6 +370,22 @@ static NSString *CNFallbackProcessName(NSString *path) {
     return name.length ? name : @"Unknown process";
 }
 
+// Read anchored report fields, never words occurring inside sampled stacks.
+static NSString *CNReportField(NSString *text, NSString *field) {
+    __block NSString *value = nil;
+    [text enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        NSRange colon = [line rangeOfString:@":"];
+        if (colon.location == NSNotFound) return;
+        NSString *key = [[line substringToIndex:colon.location]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if ([key caseInsensitiveCompare:field] != NSOrderedSame) return;
+        value = [[line substringFromIndex:colon.location + 1]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        *stop = YES;
+    }];
+    return value;
+}
+
 static NSDictionary *CNBuildNotificationForReport(NSString *path) {
     NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
     if (!data.length) return nil;
@@ -389,8 +405,12 @@ static NSDictionary *CNBuildNotificationForReport(NSString *path) {
         body = CNJSONDictionary(data);
     }
 
+    if (!body && !header) body = CNJSONDictionary(data);
+
     NSString *process = [body[@"procName"] isKindOfClass:[NSString class]] ? body[@"procName"] : nil;
     if (!process.length) process = [header[@"app_name"] isKindOfClass:[NSString class]] ? header[@"app_name"] : nil;
+    if (!process.length) process = CNReportField(text, @"Command");
+    if (!process.length) process = CNReportField(text, @"Process");
     if (!process.length) process = CNFallbackProcessName(path);
 
     NSString *filename = path.lastPathComponent;
@@ -400,7 +420,17 @@ static NSDictionary *CNBuildNotificationForReport(NSString *path) {
 
     NSDictionary *exception = [body[@"exception"] isKindOfClass:[NSDictionary class]] ? body[@"exception"] : nil;
     NSString *exceptionType = [exception[@"type"] isKindOfClass:[NSString class]] ? exception[@"type"] : nil;
-    NSString *bugType = [header[@"bug_type"] description];
+    if (!exceptionType.length) exceptionType = CNReportField(text, @"Exception Type");
+    NSString *bugType = [(header[@"bug_type"] ?: body[@"bug_type"]) description];
+    NSString *event = CNReportField(text, @"Event").lowercaseString;
+    NSString *action = CNReportField(text, @"Action taken").lowercaseString;
+    BOOL noAction = [action isEqualToString:@"none"];
+    NSString *resource = nil;
+    if ([lowerFilename containsString:@"wakeups_resource"] || [event containsString:@"wakeups"] || [bugType isEqualToString:@"142"]) resource = @"wakeups";
+    else if ([lowerFilename containsString:@"cpu_resource"] || [event isEqualToString:@"cpu usage"]) resource = @"CPU";
+    else if ([lowerFilename containsString:@"memory_resource"]) resource = @"memory";
+    else if ([lowerFilename containsString:@"_resource"] || [exceptionType hasPrefix:@"EXC_RESOURCE"]) resource = @"resource";
+
 
     NSString *title = nil;
     NSString *message = nil;
@@ -409,27 +439,24 @@ static NSDictionary *CNBuildNotificationForReport(NSString *path) {
         NSString *largest = [body[@"largestProcess"] isKindOfClass:[NSString class]] ? body[@"largestProcess"] : nil;
         title = largest.length ? [NSString stringWithFormat:@"Jetsam: %@", largest] : @"Jetsam event";
         message = @"Memory-pressure termination. Tap to open Culprit.";
-    } else if ([lowerFilename containsString:@"wakeups_resource"]) {
-        title = [NSString stringWithFormat:@"%@ wakeups limit", process];
-        message = culprit.length ? [NSString stringWithFormat:@"Culprit: %@", culprit]
-                                 : @"Wakeups resource report. Tap to open Culprit.";
-    } else if ([lowerFilename containsString:@"cpu_resource"]) {
-        title = [NSString stringWithFormat:@"%@ CPU limit", process];
-        message = culprit.length ? [NSString stringWithFormat:@"Culprit: %@", culprit]
-                                 : @"CPU resource report. Tap to open Culprit.";
-    } else if ([lowerFilename containsString:@"memory_resource"]) {
-        title = [NSString stringWithFormat:@"%@ memory limit", process];
-        message = culprit.length ? [NSString stringWithFormat:@"Culprit: %@", culprit]
-                                 : @"Memory resource report. Tap to open Culprit.";
-    } else if (exceptionType.length || body[@"faultingThread"] || body[@"threads"]) {
+    } else if (resource.length || noAction) {
+        resource = resource ?: @"resource";
+        // Sampling a loaded tweak is not evidence that it caused a resource event.
+        BOOL terminated = [action isEqualToString:@"terminated"] || [action isEqualToString:@"killed"];
+        title = [NSString stringWithFormat:@"%@ %@ %@", process, resource,
+                 noAction ? @"warning" : (terminated ? @"termination" : @"report")];
+        message = noAction ? @"iOS took no action; this report did not terminate the app. Tap to open Culprit."
+                           : (terminated ? @"iOS terminated the process for resource use. Tap to open Culprit."
+                                         : @"Resource limit reported; termination is not confirmed. Tap to open Culprit.");
+    } else if (exceptionType.length || [body[@"faultingThread"] isKindOfClass:NSNumber.class]) {
         title = [NSString stringWithFormat:@"%@ crashed", process];
         NSString *reason = exceptionType.length ? exceptionType : @"Crash detected";
         message = culprit.length ? [NSString stringWithFormat:@"%@ • Culprit: %@", reason, culprit]
                                  : [NSString stringWithFormat:@"%@ • Culprit: Unknown", reason];
     } else {
-        title = [NSString stringWithFormat:@"%@ crash report", process];
-        message = bugType.length ? [NSString stringWithFormat:@"New crash report (bug type %@). Tap to open Culprit.", bugType]
-                                 : @"New crash report detected. Tap to open Culprit.";
+        title = [NSString stringWithFormat:@"%@ diagnostic report", process];
+        message = bugType.length ? [NSString stringWithFormat:@"New diagnostic report (bug type %@). Tap to open Culprit.", bugType]
+                                 : @"New diagnostic report detected. Tap to open Culprit.";
     }
 
     return @{ @"title": title ?: @"Crash detected", @"message": message ?: @"Tap to open Culprit" };
