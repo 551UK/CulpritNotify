@@ -19,6 +19,8 @@ jobs:
           xcrun otool -hv build/USBChargeControl
       - uses: actions/upload-artifact@v4
         with:
-          name: USBChargeControl-v087-arm64
-          path: build/USBChargeControl
+          name: USBChargeControl-v087-arm64-and-source
+          path: |
+            build/USBChargeControl
+            ios-usb-charge-control/USBChargeControl.m
           retention-days: 7
